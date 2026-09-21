@@ -1,11 +1,13 @@
 {
   "name": "datemate-api",
   "version": "1.0.0",
-  "description": "",
+  "description": "Backend for DateMate — Decide with Partner sessions on Firestore",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "tsx src/index.ts"
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test \"src/**/*.test.ts\""
   },
   "repository": {
     "type": "git",
@@ -20,7 +22,6 @@
   },
   "homepage": "https://github.com/AnakAyam-C4/datemate-api#readme",
   "dependencies": {
-    "chalk": "^6.0.0",
     "cors": "^2.8.6",
     "dotenv": "^18.0.1",
     "express": "^5.2.1",

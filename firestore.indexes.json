@@ -1,0 +1,13 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "places",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "savedBy", "order": "ASCENDING" },
+        { "fieldPath": "hasVisited", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

@@ -1,4 +1,6 @@
 import { Router } from "express";
+import sessionRouter from "./sessions";
+import userRouter from "./users";
 
 const router = Router();
 
@@ -10,8 +12,14 @@ router.get("/", (_, response) => {
 });
 
 /**
- * Insert your router here
- * @example router.use("/example", exampleRouter)
+ * Liveness probe. Deliberately touches nothing, so it stays cheap and does not
+ * spend Firestore quota on uptime checks.
  */
+router.get("/health", (_, response) => {
+  response.send({ status: "success", data: { ok: true, uptime: process.uptime() } });
+});
+
+router.use("/v1/sessions", sessionRouter);
+router.use("/v1/users", userRouter);
 
 export default router;
