@@ -238,9 +238,9 @@ it gets tight: lengthen the heartbeat interval (halves the writes) and lower
 **Composite index** — `firestore.indexes.json`:
 `places` on `savedBy ASC, hasVisited ASC`.
 
-**Security rules** — merge the block in `firestore.matchSessions.rules` into the
-project's existing rules. It is deliberately not named `firestore.rules` so
-deploying it cannot wipe the rules the iOS app already depends on.
+**Security rules** — `firestore.rules` is the complete rule set for every
+collection, replacing Firebase's open test-mode default. Publish it from
+Firebase Console -> Firestore Database -> Rules.
 
 Clients may only: read a session they are in, write their own `swipes` entry,
 and refresh their own `lastSeenAt`. Status and version are server-only.

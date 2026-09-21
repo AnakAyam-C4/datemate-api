@@ -64,9 +64,9 @@ npm test
 
 - Deploy the index in `firestore.indexes.json` (`places` on `savedBy`,
   `hasVisited`).
-- Merge `firestore.matchSessions.rules` into the project's existing
-  `firestore.rules`. It is intentionally a separate file so deploying it whole
-  cannot wipe the rules the iOS app already relies on.
+- Publish `firestore.rules` — the complete rule set for all collections. The
+  iOS app talks to Firestore directly, so these rules are the only thing
+  protecting user data; the backend's service account bypasses them.
 
 ## Configuration
 

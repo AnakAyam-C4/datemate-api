@@ -1,0 +1,184 @@
+rules_version = '2';
+
+// DateMate Firestore security rules.
+//
+// These govern what the iOS app may do when it talks to Firestore directly.
+// The Express backend uses a service account (firebase-admin), which bypasses
+// rules entirely — so anything the server does is unaffected by this file.
+//
+// Publish: Firebase Console -> Firestore Database -> Rules -> paste -> Publish.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    // Which top-level fields this write would change.
+    function changed() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // NOTE: get() costs one document read each time it is evaluated, billed
+    // against the same 50k/day quota. Only used on `upcoming`, which is low
+    // volume — never on `places`, which is read in bulk.
+    function isCoupleMember(coupleId) {
+      return signedIn()
+          && exists(/databases/$(database)/documents/couples/$(coupleId))
+          && (get(/databases/$(database)/documents/couples/$(coupleId)).data.user1Id == uid()
+           || get(/databases/$(database)/documents/couples/$(coupleId)).data.user2Id == uid());
+    }
+
+    // ---------------------------------------------------------------------
+    // users/{uid}
+    // ---------------------------------------------------------------------
+    //
+    // Readable by any signed-in user, because pairing works by querying
+    // `where connectCode == "ABC123"` — you have to be able to read a document
+    // belonging to someone you are not yet connected to.
+    //
+    // Trade-off: this exposes name, avatar, connectCode and fcmTokens to any
+    // authenticated user. Firestore rules cannot hide individual fields on a
+    // read. If that matters, move fcmTokens to a `users/{uid}/private/*`
+    // subcollection that only the owner can read.
+
+    match /users/{userId} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && uid() == userId;
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // couples/{coupleId}
+    // ---------------------------------------------------------------------
+
+    match /couples/{coupleId} {
+      allow read: if signedIn()
+                  && (resource.data.user1Id == uid()
+                   || resource.data.user2Id == uid());
+
+      // You may create a couple only with yourself in it.
+      allow create: if signedIn()
+                    && (request.resource.data.user1Id == uid()
+                     || request.resource.data.user2Id == uid())
+                    && !request.resource.data.keys().hasAny(['activeSessionId']);
+
+      // Members may edit the couple (anniversary etc.) but may not repoint it
+      // at a different person, and may not forge `activeSessionId` — that
+      // pointer is what pulls a partner into a match session, and only the
+      // server is allowed to write it.
+      allow update: if signedIn()
+                    && (resource.data.user1Id == uid()
+                     || resource.data.user2Id == uid())
+                    && !changed().hasAny(['activeSessionId', 'user1Id', 'user2Id']);
+
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------------
+    // collections/{id}
+    // ---------------------------------------------------------------------
+
+    match /collections/{collectionId} {
+      allow read, delete: if signedIn() && resource.data.userId == uid();
+      allow create: if signedIn() && request.resource.data.userId == uid();
+      allow update: if signedIn()
+                    && resource.data.userId == uid()
+                    && request.resource.data.userId == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // places/{id}
+    // ---------------------------------------------------------------------
+    //
+    // Owner-only. This is safe for "Decide with Partner" because the server
+    // copies the chosen places into the session document, so the app never
+    // reads its partner's place documents during a session.
+    //
+    // ⚠️ If any OTHER screen shows the partner's saved places directly, this
+    // rule will break it. Firestore cannot get from a place to its couple
+    // without a field to follow, so the fix is to denormalise `coupleId` onto
+    // place documents (an iOS change plus a backfill) and then use:
+    //
+    //   allow read: if isCoupleMember(resource.data.coupleId);
+
+    match /places/{placeId} {
+      allow read, delete: if signedIn() && resource.data.savedBy == uid();
+      allow create: if signedIn() && request.resource.data.savedBy == uid();
+      allow update: if signedIn()
+                    && resource.data.savedBy == uid()
+                    && request.resource.data.savedBy == uid();
+    }
+
+    // ---------------------------------------------------------------------
+    // upcoming/{id}
+    // ---------------------------------------------------------------------
+
+    match /upcoming/{upcomingId} {
+      allow read, update, delete: if isCoupleMember(resource.data.coupleId);
+      allow create: if isCoupleMember(request.resource.data.coupleId);
+    }
+
+    // ---------------------------------------------------------------------
+    // matchSessions/{id}  —  "Decide with Partner"
+    // ---------------------------------------------------------------------
+    //
+    // The client may do exactly two things: read a session it belongs to, and
+    // record its own swipes and heartbeat. Creating sessions, advancing status
+    // and generating decks all go through the API.
+
+    match /matchSessions/{sessionId} {
+
+      function isParticipant() {
+        return signedIn() && uid() in resource.data.participants;
+      }
+
+      // A partner may only touch their own entry in the swipes map.
+      function onlyOwnSwipes() {
+        return request.resource.data.swipes
+                 .diff(resource.data.swipes)
+                 .affectedKeys()
+                 .hasOnly([uid()]);
+      }
+
+      // A partner may only refresh their own `lastSeenAt` heartbeat — not
+      // their `ready` flag, and never the other partner's entry.
+      function onlyOwnHeartbeat() {
+        return request.resource.data.members
+                 .diff(resource.data.members)
+                 .affectedKeys()
+                 .hasOnly([uid()])
+            && request.resource.data.members[uid()]
+                 .diff(resource.data.members[uid()])
+                 .affectedKeys()
+                 .hasOnly(['lastSeenAt']);
+      }
+
+      allow read: if isParticipant();
+
+      // Sessions are created, advanced and torn down by the server only.
+      allow create, delete: if false;
+
+      allow update: if isParticipant()
+        // Status transitions are the server's job; a client cannot skip ahead.
+        && request.resource.data.status == resource.data.status
+        && request.resource.data.version == resource.data.version
+        && changed().hasOnly(['swipes', 'members', 'updatedAt'])
+        && (!changed().hasAny(['swipes']) || onlyOwnSwipes())
+        && (!changed().hasAny(['members']) || onlyOwnHeartbeat());
+    }
+
+    // ---------------------------------------------------------------------
+    // Everything else is denied. Adding a new collection means adding a rule.
+    // ---------------------------------------------------------------------
+  }
+}
