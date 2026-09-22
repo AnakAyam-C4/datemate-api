@@ -19,7 +19,6 @@
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
 
-    "noEmit": true,
     "isolatedModules": true
   },
   "include": ["src/**/*.ts", "api/**/*.ts"],
