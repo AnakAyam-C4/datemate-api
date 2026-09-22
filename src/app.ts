@@ -8,6 +8,20 @@ import { ErrorController } from "./controllers";
 const app = express();
 
 /**
+ * Last-resort logging. A crash outside the request cycle takes the whole
+ * serverless invocation down with it, and the platform reports that as an
+ * opaque FUNCTION_INVOCATION_FAILED with no cause. These two lines are what
+ * turn that into something readable in the runtime log.
+ */
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] unhandled rejection", reason);
+});
+
+process.on("uncaughtException", (error) => {
+  console.error("[FATAL] uncaught exception", error);
+});
+
+/**
  * Enable Cross-Origin Resource Sharing (CORS) for all routes
  * This allows your API to be accessed from different domains
  */
