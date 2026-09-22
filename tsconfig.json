@@ -4,7 +4,11 @@
     "lib": ["ES2022"],
     "module": "node16",
     "moduleResolution": "node16",
-    "types": ["node"],
+
+    // No explicit "types" entry on purpose. Naming a type package there makes
+    // it a hard requirement, and a build that cannot resolve it fails with
+    // TS2688 instead of falling back — which is what broke the Vercel build.
+    // Leaving it out lets TypeScript auto-discover node_modules/@types.
 
     "strict": true,
     "noUncheckedIndexedAccess": false,
