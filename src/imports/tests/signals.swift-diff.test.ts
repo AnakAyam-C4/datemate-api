@@ -1,10 +1,16 @@
 /**
- * Differential test: runs the REAL Swift implementation (extracted at test time
- * from docs/ios-reference) and the TypeScript port on the same inputs, and
- * fails on any difference. This proves the port, rather than re-asserting
- * outputs someone typed by hand.
+ * Differential test: runs the REAL Swift implementation (extracted at test time)
+ * and the TypeScript port on the same inputs, and fails on any difference.
+ * This proves the port, rather than re-asserting outputs someone typed by hand.
  *
- * Skipped automatically where no Swift toolchain exists (Linux CI, Vercel).
+ * The name logic (AISummaryService, GeminiPlaceExtractor) is read — read-only —
+ * from the live iOS app checked out next to this repo (`../datemate`, or
+ * IOS_REPO), so the port is checked against what the app actually runs.
+ * docs/ios-reference is a hand-maintained reference and is never modified;
+ * it's only used for the files not read from the app.
+ *
+ * Skipped automatically where no Swift toolchain or iOS checkout exists
+ * (Linux CI, Vercel).
  */
 
 import assert from "node:assert/strict";
@@ -23,6 +29,8 @@ import {
   inferPriceLevel,
   inferTags,
   isConfirmed,
+  isStreetOrArea,
+  looksLikeLocation,
   parseSignals,
   swiftCapitalized,
 } from "../2-caption/signals";
@@ -31,11 +39,21 @@ import { PLACE_CATEGORIES, PLACE_SETTINGS, PLACE_VIBES } from "../shared/vocabul
 
 const REFERENCE = path.resolve(__dirname, "../../../docs/ios-reference");
 
+/** The live iOS app's services folder (read-only). */
+const IOS_SERVICES = path.join(
+  process.env.IOS_REPO ?? path.resolve(__dirname, "../../../../datemate"),
+  "DateRecommendation/Shared/Services",
+);
+/** Files read from the live app rather than from the reference. */
+const LIVE_FILES = ["AISummaryService.swift", "GeminiPlaceExtractor.swift"];
+const liveAppAvailable = LIVE_FILES.every((file) => existsSync(path.join(IOS_SERVICES, file)));
+
 const swiftAvailable = spawnSync("swiftc", ["--version"], { stdio: "ignore" }).status === 0;
 
 // --- Extract the real Swift functions ----------------------------------------
 
-const read = (file: string) => readFileSync(path.join(REFERENCE, file), "utf8");
+const read = (file: string) =>
+  readFileSync(path.join(LIVE_FILES.includes(file) ? IOS_SERVICES : REFERENCE, file), "utf8");
 
 /** Text from the line containing `start` up to (not including) the line containing `end`. */
 const between = (source: string, start: string, end: string): string => {
@@ -136,6 +154,8 @@ extension Port {
         case "confirm": return Port.isConfirmed(c.title ?? "", by: c.list ?? [])
         case "appears": return Port.appears(c.title ?? "", in: c.text ?? "")
         case "capitalize": return (c.text ?? "").capitalized
+        case "location": return looksLikeLocation(c.text ?? "")
+        case "streetOrArea": return isStreetOrArea(c.text ?? "")
         default: return NSNull()
         }
     }
@@ -169,7 +189,7 @@ const compileHarness = (): string => {
 type Case =
   | { kind: "signals"; title: string; caption: string }
   | { kind: "tags"; extraction: Extraction }
-  | { kind: "infer" | "price" | "clean" | "alias" | "capitalize"; text: string }
+  | { kind: "infer" | "price" | "clean" | "alias" | "capitalize" | "location" | "streetOrArea"; text: string }
   | { kind: "confirm"; title: string; list: string[] }
   | { kind: "appears"; title: string; text: string };
 
@@ -241,7 +261,18 @@ const NAME_CAPTIONS = [
   "Best dessert!! 📍 Kopi Senja, Kemang",
 ];
 
-const TITLES = ["", "Kyomi Cafe", "Kafe di Kemang", "bsd", "Jl. Kemang Raya No. 5", "Grand Junction", "KEDAI SORE"];
+const TITLES = [
+  "", "Kyomi Cafe", "Kafe di Kemang", "bsd", "Jl. Kemang Raya No. 5", "Grand Junction", "KEDAI SORE",
+  "Mie Gacoan Bintaro", "Starbucks Plaza Senayan",
+];
+
+/** Venues named after their area or mall must not count as locations (made-up and generic names). */
+const PLACE_OR_LOCATION = [
+  "Mie Gacoan Bintaro", "Kopi Kenangan Gading Serpong", "Masen Matcha BSD", "Starbucks PIK Avenue",
+  "Starbucks Plaza Senayan", "Kopi Park", "Street Food Corner", "Jl. Kemang Raya No. 5", "Jln. Melati",
+  "Jalan Sudirman", "jalanjalan cafe", "Grand Junction", "BSD City", "Gading Serpong, Tangerang", "Kemang Raya",
+  "Ruko Golden 8", "Tower A, Lt. 2", "Pantai Indah Kapuk 2", "Kota Tua", "Bakmi Kota", "",
+];
 
 const CONFIRM_NAMES = ["Masen Matcha", "Kopi Senja", "Jl. Kemang Raya", "KEDAI SORE", "Café Olé", "abc", "Kopi"];
 const CONFIRM_LISTS = [["#masenmatcha", "#bsd"], ["@Masen Matcha bsd"], ["#kopisenjakemang"], ["#kopi"], ["#cafeole"], ["#kedaisore"], []];
@@ -318,6 +349,11 @@ const buildCorpus = (): Case[] => {
     "ÉCLAIR", "TOKO  DUA", "A-B-C", "X&Y", "KOPI,TEH", "KOPI\tTEH", "9AM CAFE", "kopi kita", "KÖPI",
   ]) cases.push({ kind: "capitalize", text });
 
+  for (const text of PLACE_OR_LOCATION) {
+    cases.push({ kind: "location", text });
+    cases.push({ kind: "streetOrArea", text });
+  }
+
   for (const title of CONFIRM_NAMES) {
     for (const list of CONFIRM_LISTS) cases.push({ kind: "confirm", title, list });
     for (const text of APPEAR_TEXTS) cases.push({ kind: "appears", title, text });
@@ -337,6 +373,8 @@ const runTypeScript = (c: Case): unknown => {
     case "confirm": return isConfirmed(c.title, c.list);
     case "appears": return appears(c.title, c.text);
     case "capitalize": return swiftCapitalized(c.text);
+    case "location": return looksLikeLocation(c.text);
+    case "streetOrArea": return isStreetOrArea(c.text);
   }
 };
 
@@ -347,7 +385,13 @@ const normalise = (value: unknown): unknown => JSON.parse(JSON.stringify(value, 
     : v,
 ));
 
-test("TypeScript signals port matches the Swift implementation", { skip: !swiftAvailable && "no Swift toolchain" }, () => {
+const skipReason = !swiftAvailable
+  ? "no Swift toolchain"
+  : !liveAppAvailable
+    ? `iOS app not found at ${IOS_SERVICES} (set IOS_REPO)`
+    : false;
+
+test("TypeScript signals port matches the Swift implementation", { skip: skipReason }, () => {
   const binary = compileHarness();
   const corpus = buildCorpus();
 

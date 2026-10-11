@@ -60,9 +60,15 @@ test("cover and on-screen quotes must at least contain the name", () => {
   assert.equal(verifyEvidence(facts({ source: "cover_text", quote: "best matcha in town" }), context).reason, "quote_does_not_support_name");
 });
 
-test("a street, mall or area is never accepted as the place name", () => {
-  for (const name of ["Jl. Kemang Raya", "Grand Junction Mall", "Plaza Senayan", "BSD City"]) {
+test("a street or a bare area is never accepted as the place name", () => {
+  for (const name of ["Jl. Kemang Raya", "Jalan Sudirman 5", "BSD City", "Gading Serpong, Tangerang"]) {
     assert.equal(verifyEvidence(facts({ name, source: "cover_text", quote: name }), context).reason, "location_not_name", name);
+  }
+});
+
+test("a venue named after its area or mall is still accepted", () => {
+  for (const name of ["Mie Gacoan Bintaro", "Masen Matcha BSD", "Starbucks Plaza Senayan"]) {
+    assert.equal(verifyEvidence(facts({ name, source: "cover_text", quote: name.toUpperCase() }), context).accepted, true, name);
   }
 });
 
