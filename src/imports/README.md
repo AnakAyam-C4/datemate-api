@@ -13,7 +13,10 @@ link ─▶ 1-tiktok ─▶ 2-caption ─┬─ name confirmed by #hashtag/@ment
 A TikTok location tag or a `📍` line is often only a street, mall or area, so
 on its own it never decides the name: only a hashtag or @mention that spells
 the same name is proof enough to skip Gemini. A street, mall or area is never
-saved as the name — it becomes the address.
+saved as the name — it becomes the address. When the caption does give a venue
+name (next to the `📍` line), that name beats Gemini's: the model can drift onto
+a series title or list hashtag, the location line can't. Gemini's name is only
+used when the caption has no candidate of its own.
 
 | Folder | What it does | Uses Gemini? | Costs |
 |---|---|---|---|

@@ -169,6 +169,8 @@ Finding the name:
 - The name must be the venue itself — the café, restaurant, shop or attraction people go to. Streets ("Jl. …", "Jalan …"), malls, buildings, ruko blocks, junctions and areas are locations, not names: put them in area.
 - The TikTok location tag and a "📍" / "lokasi:" line often hold only the location. The venue's name is then elsewhere in the caption — a short line on its own, a mention or a hashtag. Read the whole caption to find it.
 - The name is often hidden in a mention or hashtag: "@Masen Matcha" or "#masenmatcha" means "Masen Matcha".
+- A name right after "📍" is usually the venue, unless it is a street, mall, building or area.
+- Series or campaign titles, list phrases ("100 places worth trying", "part 3", "episode 12") and list hashtags are about the video, not the venue — never use them as the name.
 - Never use the creator's account name as the place name, and never a generic phrase like "hidden gem" or "cafe".
 - Only report a name that is explicitly written or spoken. Never guess from the type of food, the decor or the area. If no place name is explicitly present, return an empty name, source "none", an empty quote and confidence 0. An empty answer is correct and expected for many posts.
 - nameEvidence.quote must be copied verbatim from where you saw or heard the name.
