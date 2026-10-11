@@ -32,11 +32,21 @@ final class AISummaryService {
     static let shared = AISummaryService()
     private init() {}
 
+    /// Last-resort label when no place name could be found anywhere.
+    private static let unknownPlaceName = "this place"
+
+    /// Skip Gemini only when the caption itself confirms the name — the tag or
+    /// 📍 name also appears as a hashtag or @mention ("Masen Matcha" +
+    /// #masenmatcha). A tag or 📍 line alone isn't enough: it's often just a
+    /// street, mall or area, and only Gemini can tell that from the caption.
+    /// Saves quota where it's safe; set to false to always ask Gemini.
+    private static let skipGeminiWhenNameConfirmed = true
+
     // MARK: - Generate Summary
 
     /// Generates a concise, date-friendly summary from scraped TikTok metadata.
     /// - Parameters:
-    ///   - placeName: Name of the place (from POI or OG title).
+    ///   - placeName: TikTok's POI name, only if the creator attached a location.
     ///   - address: Full address string.
     ///   - caption: Original TikTok caption / video description.
     ///   - authorNickname: The creator's display name, passed to the model so
@@ -49,18 +59,32 @@ final class AISummaryService {
         authorNickname: String? = nil
     ) async -> PlaceSummary {
 
-        let name = placeName ?? "this place"
+        // Only a real POI name counts as an already-known title. This used to
+        // be `placeName ?? "this place"`, and the scraper passed the page's
+        // og:title when there was no POI — both never empty, so the 📍 parser
+        // below never ran and that title always beat Gemini's name.
+        let name = placeName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let addr = address   ?? ""
         // Gemini's context window comfortably fits a full TikTok caption —
         // no need for the aggressive truncation the old on-device model needed.
         let cap = String((caption ?? "").prefix(4000))
 
         // Deterministic pre-parse: "📍 Name, Area" lines, mentions, hashtags,
-        // prices. High-precision signals that don't need the model at all,
-        // and win over the model's guess when both exist.
+        // prices. Free hints — the name candidate is only trusted on its own
+        // when the caption confirms it; otherwise Gemini reads the caption.
         let signals = parseSignals(title: name, caption: cap)
 
-        if let result = await runGemini(
+        // The caption confirms the name (hashtag / @mention), it isn't a
+        // street, mall or area, and we know where it is. No Gemini needed.
+        let nameConfirmed = signals.nameCandidate.map { candidate in
+            !looksLikeLocation(candidate)
+                && Self.isConfirmed(candidate, by: signals.hashtags + signals.mentions)
+        } ?? false
+        let locationKnown = signals.addressCandidate != nil || !addr.isEmpty
+
+        if Self.skipGeminiWhenNameConfirmed && nameConfirmed && locationKnown {
+            print("AISummaryService: name confirmed by a hashtag/mention — skipping Gemini")
+        } else if let result = await runGemini(
             name: name,
             address: addr,
             caption: cap,
@@ -70,16 +94,41 @@ final class AISummaryService {
             return result
         }
 
-        // Heuristic fallback — composed from parsed signals, never the raw caption
-        let fallbackName = signals.nameCandidate ?? name
+        // No-Gemini path: the location was already known, or Gemini failed.
+        // Composed from parsed signals, never the raw caption.
+        let fallbackName = signals.nameCandidate ?? Self.unknownPlaceName
         let fallbackAddress = signals.addressCandidate ?? addr
+        let fallbackPrice = signals.priceLevel ?? inferPriceLevel(from: cap)
+
+        // On-device Foundation Models can still write a real description from
+        // the few facts we have. Only with a real name — "this place is a
+        // budget-friendly spot…" reads worse than the template.
+        var summary = fallbackSummary(name: fallbackName, address: fallbackAddress, caption: cap)
+        var isAIGenerated = false
+        if signals.nameCandidate != nil,
+           let written = await PlaceDescriptionWriter.describe(
+               PlaceFacts(
+                   name: fallbackName,
+                   area: fallbackAddress,
+                   category: nil,
+                   specialty: "",
+                   vibes: [],
+                   setting: nil,
+                   highlights: [],
+                   priceLevel: fallbackPrice
+               )
+           ) {
+            summary = written
+            isAIGenerated = true
+        }
+
         return PlaceSummary(
             name: fallbackName,
             address: fallbackAddress,
-            summary: fallbackSummary(name: fallbackName, address: fallbackAddress, caption: cap),
+            summary: summary,
             tags: inferTags(from: cap + " " + name + " " + signals.hashtags.joined(separator: " ")),
-            priceLevel: signals.priceLevel ?? inferPriceLevel(from: cap),
-            isAIGenerated: false
+            priceLevel: fallbackPrice,
+            isAIGenerated: isAIGenerated
         )
     }
 
@@ -159,30 +208,69 @@ final class AISummaryService {
         signals.mentions = regexMatches("@[\\w][\\w. ]{1,29}", in: caption)
         signals.hashtags = regexMatches("#\\w+", in: caption)
         
-        if title.isEmpty {
-            // "📍 Kyomi Cafe, BSD City" / "lokasi: Bakmi Aloi, Ruko Glaze 2" —
-            // the creator-authored location line is the most reliable signal.
-            if let hint = regexMatches(
-                "(?:📍|\\bloc(?:ation)?\\s*[:=]|\\blokasi\\s*[:=]?|\\balamat\\s*[:=]?)\\s*([^#\\n!?📍]{3,70})",
-                in: caption,
-                group: 1
-            ).first {
-                let parts = hint
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .components(separatedBy: ",")
-                    .map { $0.trimmingCharacters(in: .whitespaces) }
-                    .filter { !$0.isEmpty }
-                if let first = parts.first {
-                    signals.nameCandidate = first
-                    if parts.count > 1 {
-                        signals.addressCandidate = parts.dropFirst().joined(separator: ", ")
-                    }
+        // TikTok's location tag (only when the creator attached one).
+        let poiName = title.isEmpty ? nil : title
+
+        // "📍 Kyomi Cafe, BSD City" / "lokasi: Bakmi Aloi, Ruko Glaze 2" —
+        // the creator-authored location line.
+        if let hint = regexMatches(Self.locationLinePattern, in: caption, group: 1).first {
+            // Without line breaks the pin text runs on into the next sentence;
+            // a double space is where a line break used to be.
+            let locationLine = (hint.components(separatedBy: "  ").first ?? hint)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let parts = locationLine
+                .components(separatedBy: ",")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+
+            // A name on its own line, then "📍 <mall or area>": the pin line is
+            // where the place is, so the name is next to it — not the first part
+            // of the pin. (A tagged location only counts when it is itself a
+            // location — a tag that names the venue should stay the name.)
+            let poiIsLocation = poiName.map { looksLikeLocation($0) && locationLine.localizedCaseInsensitiveContains($0) } ?? false
+            let pinIsLocation = poiIsLocation || looksLikeLocation(parts.first ?? "")
+
+            // The name next to the pin: first the text just before it on the
+            // same line (captions don't always keep their line breaks, so the
+            // name and the pin can end up on one line), then the line above.
+            let nameNearPin = [textBeforeLocationMarker(in: caption), lineAbove(locationLine, in: caption)]
+                .compactMap { $0 }
+                .first(where: looksLikeName)
+
+            if pinIsLocation, let nameNearPin {
+                signals.nameCandidate = nameNearPin
+                signals.addressCandidate = locationLine
+                print("AISummaryService: name from the text next to the 📍 line")
+            } else if let poiName, !poiIsLocation {
+                // A tag that names the venue, not a mall or area.
+                signals.nameCandidate = poiName
+                print("AISummaryService: name from TikTok's location tag")
+            } else if pinIsLocation {
+                // The pin (and any tag) only say WHERE it is — a mall or an area,
+                // not the place. Leave the name to Gemini, which reads the whole
+                // caption, instead of saving the mall as the place.
+                signals.addressCandidate = locationLine
+                print("AISummaryService: 📍 line is a location with no name next to it — Gemini will find the name")
+            } else if let first = parts.first {
+                signals.nameCandidate = first
+                if parts.count > 1 {
+                    signals.addressCandidate = parts.dropFirst().joined(separator: ", ")
                 }
+                print("AISummaryService: name from the 📍 line itself (pin is location: \(pinIsLocation), name near pin: \(nameNearPin ?? "none"))")
             }
+        } else if let poiName, looksLikeLocation(poiName) {
+            // The tag is a street, mall or area — keep it as the location only.
+            signals.addressCandidate = poiName
+            print("AISummaryService: no 📍 line — TikTok's location tag is a location, not a name")
         } else {
-            signals.nameCandidate = title
+            signals.nameCandidate = poiName
+            print("AISummaryService: no 📍 line — name from TikTok's location tag: \(poiName ?? "none")")
         }
 
+        // All-caps names read better capitalized ("NAMA TOKO" → "Nama Toko")
+        if let name = signals.nameCandidate, name == name.uppercased(), name.contains(where: \.isLetter) {
+            signals.nameCandidate = name.capitalized
+        }
 
         // Known-area scan: catches "#gadingserpong", "di PIK", etc. even when
         // there's no 📍 line and the model call fails.
@@ -218,6 +306,111 @@ final class AISummaryService {
         return signals
     }
 
+    /// "📍 Kyomi Cafe, BSD City" / "lokasi: Bakmi Aloi" — group 1 is the text after the marker.
+    /// "lokasi"/"alamat" must be whole words ("lokasinya:" is allowed explicitly):
+    /// without the \b, "Lokasinya 📍 …" matched "lokasi" and returned "nya".
+    /// "•" and "|" end the text too — they separate caption sections.
+    private static let locationLinePattern =
+        "(?:📍|\\bloc(?:ation)?\\s*[:=]|\\blokasi(?:nya)?\\b\\s*[:=]?|\\balamat(?:nya)?\\b\\s*[:=]?)\\s*([^#\\n!?📍•|]{3,70})"
+
+    /// The text just before the 📍 / "lokasi:" marker on the same line, back to
+    /// the previous sentence end or emoji: "…buka besok! NAMA TOKO 📍 <location>"
+    /// gives "NAMA TOKO". nil when the marker starts its line.
+    private func textBeforeLocationMarker(in caption: String) -> String? {
+        guard
+            let regex = try? NSRegularExpression(pattern: Self.locationLinePattern, options: [.caseInsensitive]),
+            let match = regex.firstMatch(in: caption, range: NSRange(caption.startIndex..., in: caption)),
+            let marker = Range(match.range, in: caption)
+        else { return nil }
+
+        var chunk: [Character] = []
+        for character in caption[..<marker.lowerBound].reversed() {
+            let isEmoji = character.unicodeScalars.contains { $0.properties.isEmojiPresentation }
+            if character.isNewline || "!?.•#".contains(character) || isEmoji { break }
+            chunk.append(character)
+        }
+        let text = String(chunk.reversed()).trimmingCharacters(in: .whitespaces)
+        return text.isEmpty ? nil : text
+    }
+
+    /// The nearest non-empty line above the one containing `text`, emoji removed.
+    private func lineAbove(_ text: String, in caption: String) -> String? {
+        let lines = caption.components(separatedBy: .newlines)
+        guard let index = lines.firstIndex(where: { $0.contains(text) }), index > 0 else { return nil }
+        for line in lines[..<index].reversed() {
+            let cleaned = String(line.unicodeScalars.filter { !$0.properties.isEmojiPresentation })
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !cleaned.isEmpty { return cleaned }
+        }
+        return nil
+    }
+
+    /// A short standalone line that could be a shop's name — not a sentence
+    /// like "Rekomendasi cafe baru di BSD!".
+    private func looksLikeName(_ line: String) -> Bool {
+        let lower = line.lowercased()
+        let words = line.split(separator: " ")
+        guard (2...40).contains(line.count), (1...6).contains(words.count),
+              line.contains(where: \.isLetter),
+              !line.contains(where: { "#@!?:".contains($0) }),
+              !lower.contains("http")
+        else { return false }
+
+        let filler = [" di ", "rekomendasi", "review", "tempat", "buat ", "yang ", "baru", "enak",
+                      "murah", "wajib", "cobain", "nyobain", "kuliner", "the best", "must try",
+                      " spot ", " date ", " vibes ", " aesthetic ",
+                      // "Lokasinya 📍 …" introduces the pin; it isn't a name
+                      "lokasi", "alamat", "location", "address",
+                      // "nemu cafe gemes" is a reaction, not a name
+                      "nemu", "gemes", "gemas"]
+        return !filler.contains { (" " + lower + " ").contains($0) }
+    }
+
+    /// Lowercase letters and digits only, accents folded: "Masen Matcha",
+    /// "#masenmatcha" and "@Masen_Matcha" all become "masenmatcha".
+    private static func squashed(_ text: String) -> String {
+        String(
+            text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+                .unicodeScalars
+                .filter { CharacterSet.alphanumerics.contains($0) }
+        )
+        .lowercased()
+    }
+
+    /// True when a hashtag or @mention spells out the name — strong proof the
+    /// name is the venue, since nobody hashtags the street a café is on.
+    private static func isConfirmed(_ name: String, by tagsAndMentions: [String]) -> Bool {
+        let target = squashed(name)
+        guard target.count >= 4 else { return false }
+        return tagsAndMentions.contains { squashed($0).contains(target) }
+    }
+
+    /// True when `name` really occurs in `text` — spelled out, or squashed into
+    /// a hashtag, or (for longer names) with at least 60% of its words present.
+    private static func appears(_ name: String, in text: String) -> Bool {
+        let target = squashed(name)
+        guard target.count >= 3 else { return false }
+        if squashed(text).contains(target) { return true }
+
+        let words = { (value: String) in
+            Set(value.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted).filter { $0.count >= 2 })
+        }
+        let nameWords = words(name)
+        guard nameWords.count >= 2 else { return false }
+        return Double(nameWords.intersection(words(text)).count) / Double(nameWords.count) >= 0.6
+    }
+
+    /// A mall, a junction, a ruko, a street, a known area — somewhere a place
+    /// is, rather than the place itself.
+    private func looksLikeLocation(_ text: String) -> Bool {
+        let lower = " " + text.lowercased() + " "
+        let markers = [" mall", " junction", " plaza", " square", " tower", " ruko ", " jl ", " jl.", " jalan ",
+                       " lt ", " lt.", " lantai ", " blok ", " boulevard", " market", " park ", " city ",
+                       " residence", " walk ", " avenue", " street"]
+        if markers.contains(where: lower.contains) { return true }
+        return Self.knownAreas.contains { entry in entry.keys.contains { lower.contains(" \($0) ") } }
+    }
+
     // MARK: - Gemini (Firebase AI Logic)
 
     private func runGemini(
@@ -238,11 +431,25 @@ final class AISummaryService {
             )
             let elapsed = Date().timeIntervalSince(start)
 
-            // The creator-authored "📍 Name, Area" line beats the model when
-            // both exist — the model can drift, the location line can't.
+            // Gemini read the whole caption, so its venue name wins over the
+            // tag / 📍 line — those are often just a street, mall or area.
+            // Guard: the name has to actually appear in what Gemini was given
+            // (caption, hashtags, tag), so it can't make one up.
             let modelName = extraction.name.trimmingCharacters(in: .whitespacesAndNewlines)
             let modelAddress = extraction.address.trimmingCharacters(in: .whitespacesAndNewlines)
-            var finalName = signals.nameCandidate ?? (modelName.isEmpty ? name : modelName)
+            let givenText = [caption, name, address].joined(separator: " ")
+            let modelNameIsGrounded = !modelName.isEmpty
+                && !looksLikeLocation(modelName)
+                && Self.appears(modelName, in: givenText)
+            // Without a grounded Gemini name, fall back to the caption's own
+            // candidate — but never to something that looks like a location.
+            let fallbackCandidate = signals.nameCandidate.flatMap { looksLikeLocation($0) ? nil : $0 }
+            var finalName = modelNameIsGrounded
+                ? modelName
+                : (fallbackCandidate ?? Self.unknownPlaceName)
+            if !modelName.isEmpty && !modelNameIsGrounded {
+                print("AISummaryService: ignoring Gemini name '\(modelName)' — not found in the caption or looks like a location")
+            }
             let finalAddress = (signals.addressCandidate ?? modelAddress).isEmpty
                 ? address
                 : (signals.addressCandidate ?? modelAddress)
@@ -252,22 +459,37 @@ final class AISummaryService {
             // ambiguous — e.g. a creator who names their account after their shop).
             if let authorNickname, !authorNickname.isEmpty,
                finalName.caseInsensitiveCompare(authorNickname) == .orderedSame {
-                finalName = signals.nameCandidate ?? name
+                finalName = fallbackCandidate ?? Self.unknownPlaceName
             }
 
-            let summary = extraction.summary.trimmingCharacters(in: .whitespacesAndNewlines)
-            let finalSummary = summary.isEmpty
-                ? fallbackSummary(name: finalName, address: finalAddress, caption: caption)
-                : summary
+            let finalPrice = signals.priceLevel ?? max(1, min(4, extraction.priceLevel))
 
             print("AISummaryService: gemini extracted name='\(finalName)' area='\(finalAddress)' category=\(extraction.category) in \(String(format: "%.2f", elapsed))s")
+
+            // The description is written from the final (already corrected)
+            // facts only — never from the raw caption — by on-device Foundation
+            // Models. Never Gemini, to save quota; the template otherwise.
+            let written = await PlaceDescriptionWriter.describe(
+                PlaceFacts(
+                    name: finalName,
+                    area: finalAddress,
+                    category: extraction.category,
+                    specialty: extraction.specialty,
+                    vibes: extraction.vibes,
+                    setting: extraction.setting,
+                    highlights: extraction.highlights,
+                    priceLevel: finalPrice
+                )
+            )
+            let finalSummary = written ?? fallbackSummary(name: finalName, address: finalAddress, caption: caption)
+            print("AISummaryService: description from \(written == nil ? "template" : "Foundation Models")")
 
             return PlaceSummary(
                 name: finalName,
                 address: finalAddress,
                 summary: finalSummary,
                 tags: buildTags(from: extraction),
-                priceLevel: signals.priceLevel ?? max(1, min(4, extraction.priceLevel)),
+                priceLevel: finalPrice,
                 isAIGenerated: true
             )
         } catch {
@@ -333,9 +555,10 @@ final class AISummaryService {
     // MARK: - Fallback helpers
 
     private func fallbackSummary(name: String, address: String, caption: String) -> String {
-        // Never dump the raw caption — compose a clean sentence instead.
+        // Never dump the raw caption — compose a plain sentence instead.
+        let place = name == Self.unknownPlaceName ? "This spot" : name
         let areaPart = address.isEmpty ? "" : " in \(address)"
-        return "\(name)\(areaPart) — saved from a TikTok you loved. Open the post for the full vibe, and check the map below to plan your visit."
+        return "\(place)\(areaPart), saved for your next date together. Open the map below to plan your visit."
     }
 
     private func inferTags(from text: String) -> [String] {

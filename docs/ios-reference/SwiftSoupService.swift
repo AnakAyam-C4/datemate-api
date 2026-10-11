@@ -3,7 +3,7 @@
 //  DateRecommendation
 //
 //  Scrapes a TikTok video page to extract:
-//  - thumbnail URL (video.originCover / video.cover)
+//  - thumbnail URL (video.cover — the cover shown on TikTok — then originCover)
 //  - POI address (poi.address)
 //  - POI name (poi.name)
 //  - Caption (desc)
@@ -15,9 +15,9 @@ import SwiftSoup
 // MARK: - Result model
 
 struct TikTokMetadata {
-    let title: String?          // poi.name or parsed from caption
+    let title: String?          // poi.name — only when the creator attached a location
     let caption: String?        // desc (original TikTok caption)
-    let thumbnailURL: String?   // video.originCover or video.cover
+    let thumbnailURL: String?   // video.cover (the thumbnail TikTok shows), else originCover
     let address: String?        // poi.address
     let authorNickname: String? // author.nickname
 }
@@ -63,9 +63,12 @@ final class SwiftSoupService {
 
         var request = URLRequest(url: url)
         request.timeoutInterval = 30
-        // Mimick mobile Safari so TikTok serves OG/script data
+        // Desktop Safari on purpose. For an iPhone User-Agent TikTok serves a
+        // stripped "reflow" page with no video data at all — no caption, no
+        // POI, not even og:title (measured 2026-10-11). The desktop page has
+        // the full __UNIVERSAL_DATA_FOR_REHYDRATION__ itemStruct.
         request.setValue(
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
             forHTTPHeaderField: "User-Agent"
         )
         request.setValue(
@@ -96,8 +99,29 @@ final class SwiftSoupService {
 
         // --- Open Graph fallbacks (always available even without JS) ---
         let ogImage   = try? document.select("meta[property=og:image]").first()?.attr("content")
-        let ogTitle   = try? document.select("meta[property=og:title]").first()?.attr("content")
         let ogDesc    = try? document.select("meta[property=og:description]").first()?.attr("content")
+
+        // --- Direct read of the video's JSON (preferred, deterministic) ---
+        if let item = itemStruct(in: document) {
+            func text(_ value: Any?) -> String? { (value as? String)?.nilIfEmpty }
+            let author = item["author"] as? [String: Any]
+            let video = item["video"] as? [String: Any]
+            let poi = item["poi"] as? [String: Any]
+
+            return TikTokMetadata(
+                title: text(poi?["name"]),
+                caption: text(item["desc"]) ?? ogDesc?.nilIfEmpty,
+                // `cover` is the thumbnail the creator picked (what TikTok
+                // shows); `originCover` is just the video's first frame.
+                thumbnailURL: text(video?["cover"]) ?? ogImage?.nilIfEmpty ?? text(video?["originCover"]),
+                address: text(poi?["address"]) ?? text(poi?["name"]),
+                authorNickname: text(author?["nickname"]) ?? text(author?["uniqueId"])
+            )
+        }
+
+        // --- Fallback: flatten every JSON blob on the page ---
+        // Kept for older page layouts. Not deterministic: it walks a
+        // Dictionary (random order per launch) and keeps only 150 fields.
 
         // --- Script-based extraction (TikTok embeds JSON in script tags) ---
         var scriptFields: [String: String] = [:]
@@ -129,13 +153,21 @@ final class SwiftSoupService {
             }
         }
 
+        // Exact "cover" only: firstScriptValue's suffix/contains matching
+        // would also pick up "originCover" or "dynamicCover".
+        let cover = scriptFields.first { field in
+            let key = field.key.lowercased()
+            return key == "cover" || key.hasSuffix(".cover")
+        }?.value.nilIfEmpty
+
         let originCover = firstScriptValue(
             keys: ["originCover", "origincover", "shareCover", "sharecover"],
             in: scriptFields
         )
 
-        let thumbnailURL = originCover ?? ogImage ?? firstScriptValue(
-            keys: ["cover", "thumbnailUrl", "thumbnailurl"],
+        // The creator's chosen cover (what TikTok shows) before the first frame
+        let thumbnailURL = cover ?? ogImage?.nilIfEmpty ?? originCover ?? firstScriptValue(
+            keys: ["thumbnailUrl", "thumbnailurl"],
             in: scriptFields
         )
 
@@ -159,8 +191,10 @@ final class SwiftSoupService {
             in: scriptFields
         )
 
-        // Use poi.name as title first, fall back to OG title
-        let title = poiName ?? ogTitle
+        // Only a real POI name is a title. og:title is the page's title (often
+        // the caption or "TikTok - Make Your Day"), and passing it on used to
+        // override the place name Gemini extracted.
+        let title = poiName
 
         return TikTokMetadata(
             title: title?.nilIfEmpty,
@@ -172,6 +206,20 @@ final class SwiftSoupService {
     }
 
     // MARK: - JSON helpers
+
+    /// The one JSON path that holds the video's data:
+    /// __UNIVERSAL_DATA_FOR_REHYDRATION__ → __DEFAULT_SCOPE__["webapp.video-detail"].itemInfo.itemStruct
+    private func itemStruct(in document: Document) -> [String: Any]? {
+        guard
+            let script = try? document.select("script#__UNIVERSAL_DATA_FOR_REHYDRATION__").first(),
+            let root = parseJSON(script.data()) as? [String: Any],
+            let scope = root["__DEFAULT_SCOPE__"] as? [String: Any],
+            let detail = scope["webapp.video-detail"] as? [String: Any],
+            let itemInfo = detail["itemInfo"] as? [String: Any],
+            let item = itemInfo["itemStruct"] as? [String: Any]
+        else { return nil }
+        return item
+    }
 
     private func extractBalancedJSON(in text: String, after marker: String) -> Any? {
         guard let markerRange = text.range(of: marker) else { return nil }

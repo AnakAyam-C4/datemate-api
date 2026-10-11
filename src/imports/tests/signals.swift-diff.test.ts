@@ -16,12 +16,15 @@ import path from "node:path";
 import { test } from "node:test";
 import { seededRandom } from "../../utils/random";
 import {
+  appears,
   buildTags,
   cleanPlaceName,
   expandAreaAliases,
   inferPriceLevel,
   inferTags,
+  isConfirmed,
   parseSignals,
+  swiftCapitalized,
 } from "../2-caption/signals";
 import type { PlaceCategory, PlaceSetting, PlaceVibe } from "../shared/vocabulary";
 import { PLACE_CATEGORIES, PLACE_SETTINGS, PLACE_VIBES } from "../shared/vocabulary";
@@ -91,6 +94,9 @@ const buildSwiftHarness = (): string => {
 
   return `import Foundation
 
+/// The Swift code logs its decisions with print(); silence it so stdout is only the JSON.
+func print(_ items: Any..., separator: String = " ", terminator: String = "\\n") {}
+
 ${between(extractor, "enum PlaceCategory", "enum GeminiPlaceExtractorError")}
 
 final class Port {
@@ -106,6 +112,7 @@ struct Case: Decodable {
     let title: String?
     let caption: String?
     let text: String?
+    let list: [String]?
     let extraction: GeminiPlaceExtraction?
 }
 
@@ -126,6 +133,9 @@ extension Port {
         case "price": return inferPriceLevel(from: c.text ?? "")
         case "clean": return cleanPlaceName(c.text ?? "")
         case "alias": return expandAreaAliases(c.text ?? "")
+        case "confirm": return Port.isConfirmed(c.title ?? "", by: c.list ?? [])
+        case "appears": return Port.appears(c.title ?? "", in: c.text ?? "")
+        case "capitalize": return (c.text ?? "").capitalized
         default: return NSNull()
         }
     }
@@ -159,7 +169,9 @@ const compileHarness = (): string => {
 type Case =
   | { kind: "signals"; title: string; caption: string }
   | { kind: "tags"; extraction: Extraction }
-  | { kind: "infer" | "price" | "clean" | "alias"; text: string };
+  | { kind: "infer" | "price" | "clean" | "alias" | "capitalize"; text: string }
+  | { kind: "confirm"; title: string; list: string[] }
+  | { kind: "appears"; title: string; text: string };
 
 type Extraction = {
   name: string;
@@ -208,14 +220,45 @@ const CAPTIONS = [
   "1́,5 juta", "25ḱ", "jakartá", "#bsd́",
 ];
 
-const TITLES = ["", "Kyomi Cafe", "Kafe di Kemang", "bsd"];
+/** Name next to the pin vs. a pin that is only a location (made-up names). */
+const NAME_CAPTIONS = [
+  "Dessert baru di Gading Serpong! 🥭 buka besok!\n\nKEDAI SORE\n📍 Grand Junction, Gading Serpong\n\nKuliner gading serpong • #dessert",
+  "Dessert baru di Gading Serpong! 🥭 buka besok!  KEDAI SORE 📍 Grand Junction, Gading Serpong  Kuliner gading serpong • #dessert",
+  "KEDAI SORE 📍 Grand Junction, Gading Serpong",
+  "Lokasinya 📍 Grand Junction, Gading Serpong",
+  "Lokasinya: Kopi Senja, Kemang",
+  "alamatnya Jl. Pahlawan Seribu, BSD City",
+  "enak bgt\n📍 Grand Junction, Gading Serpong",
+  "nemu cafe gemes 📍 Plaza Senayan, Jakarta",
+  "Kopi Pagi\r\n📍 Ruko Golden 8, Gading Serpong",
+  "KOPI-KITA\n📍 Jl. Kemang Raya No. 5",
+  "MCDONALD'S\n📍 Mall Kelapa Gading",
+  "CAFE 9\n📍 Tower A, Lt. 2, Senayan",
+  "TOKO ÉCLAIR\n📍 Grand Junction",
+  "café olé\n📍 Plaza Senayan",
+  "📍 Kopi Senja | Kemang",
+  "📍 Kopi Senja • Kemang",
+  "Best dessert!! 📍 Kopi Senja, Kemang",
+];
+
+const TITLES = ["", "Kyomi Cafe", "Kafe di Kemang", "bsd", "Jl. Kemang Raya No. 5", "Grand Junction", "KEDAI SORE"];
+
+const CONFIRM_NAMES = ["Masen Matcha", "Kopi Senja", "Jl. Kemang Raya", "KEDAI SORE", "Café Olé", "abc", "Kopi"];
+const CONFIRM_LISTS = [["#masenmatcha", "#bsd"], ["@Masen Matcha bsd"], ["#kopisenjakemang"], ["#kopi"], ["#cafeole"], ["#kedaisore"], []];
+const APPEAR_TEXTS = [
+  "KEDAI SORE\n📍 Jl. Pahlawan Seribu #kedaisore",
+  "nemu masen matcha di bsd",
+  "Café Olé di Senopati",
+  "kopi senja enak",
+  "#masenmatcha",
+];
 
 const SPECIALTIES = ["", "  Sunset View ", "fyp", "ab", "abc", "cafe", "🍵🍵🍵", "café", "café", "シシシ", "Japanese", "fypシ", "street food", "áb"];
 
 const buildCorpus = (): Case[] => {
   const cases: Case[] = [];
 
-  for (const caption of CAPTIONS) {
+  for (const caption of [...CAPTIONS, ...NAME_CAPTIONS]) {
     for (const title of TITLES) cases.push({ kind: "signals", title, caption });
     cases.push({ kind: "infer", text: caption });
     cases.push({ kind: "price", text: caption });
@@ -270,6 +313,16 @@ const buildCorpus = (): Case[] => {
     "near BSD", "pik pik", "", "BSDCITY",
   ]) cases.push({ kind: "alias", text });
 
+  for (const text of [
+    "KOPI-KITA", "MCDONALD'S", "O’NEIL", "KOPI/TEH", "7ELEVEN", "CAFE 9", "(KOPI)", "KOPI_KITA", "KOPI.ID",
+    "ÉCLAIR", "TOKO  DUA", "A-B-C", "X&Y", "KOPI,TEH", "KOPI\tTEH", "9AM CAFE", "kopi kita", "KÖPI",
+  ]) cases.push({ kind: "capitalize", text });
+
+  for (const title of CONFIRM_NAMES) {
+    for (const list of CONFIRM_LISTS) cases.push({ kind: "confirm", title, list });
+    for (const text of APPEAR_TEXTS) cases.push({ kind: "appears", title, text });
+  }
+
   return cases;
 };
 
@@ -281,6 +334,9 @@ const runTypeScript = (c: Case): unknown => {
     case "price": return inferPriceLevel(c.text);
     case "clean": return cleanPlaceName(c.text);
     case "alias": return expandAreaAliases(c.text);
+    case "confirm": return isConfirmed(c.title, c.list);
+    case "appears": return appears(c.title, c.text);
+    case "capitalize": return swiftCapitalized(c.text);
   }
 };
 
