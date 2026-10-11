@@ -27,11 +27,13 @@ export const importsConfig = () => ({
   },
   routing: {
     /**
-     * Skip Gemini entirely when TikTok's POI tag or a 📍/lokasi line already
-     * names the place. Decided 2026-10-11; flip to false to always run the
-     * caption call (richer tags, costs one Flash-Lite request).
+     * Skip Gemini only when the caption itself confirms the name: the POI/📍
+     * name also appears as a hashtag or @mention (`isConfirmed`) and isn't a
+     * street, mall or area. A POI tag or 📍 line alone is often just a
+     * location, so otherwise Gemini picks the venue from the whole caption.
+     * Same rule as the iOS app (2026-10-12). False = always ask Gemini.
      */
-    skipGeminiWhenDeterministic: bool(process.env.GEMINI_SKIP_WHEN_DETERMINISTIC, true),
+    skipGeminiWhenNameConfirmed: bool(process.env.GEMINI_SKIP_WHEN_NAME_CONFIRMED, true),
   },
   video: {
     /** Kill switch for the yt-dlp + Gemini video tier (ToS / blocking / quota). */
