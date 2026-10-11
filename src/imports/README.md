@@ -18,6 +18,21 @@ name (next to the `📍` line), that name beats Gemini's: the model can drift on
 a series title or list hashtag, the location line can't. Gemini's name is only
 used when the caption has no candidate of its own.
 
+Name, address and map — both pipelines (`chooseName`, `combinedAddress`,
+`shortArea` in `2-caption/signals.ts`, same as the iOS app):
+
+- **Name:** caption name (📍 line / name next to it) → Gemini's name, only if
+  it's in the caption and isn't a series title ("100 …", "part 3") → TikTok's
+  location tag → "this place". The tag is often the mall or a spot nearby, so
+  what the caption says wins.
+- **Address:** the creator's 📍 line → the street / building from the caption
+  joined with the known area ("Jl. …, Serpong, Tangerang Selatan") → the tag's
+  address. The description gets a short version ("Ruko …, Gading Serpong").
+- **Map (iOS today; `5-location/` still needs this step):** first an anchor —
+  the location tag, else a street from the caption, else the 📍 building,
+  else the area — then the venue name is searched near it (3 km, 30 km for a
+  bare area). If the map doesn't know the venue, the anchor is saved.
+
 | Folder | What it does | Uses Gemini? | Costs |
 |---|---|---|---|
 | `1-tiktok/` | Turns the link into a video id, then reads the TikTok page: caption, creator, cover image, and TikTok's location tag (POI) if the creator added one | No | Free |

@@ -30,7 +30,7 @@ const RESPONSE_JSON_SCHEMA = {
   type: "object",
   properties: {
     name: { type: "string", description: "The venue's own name — the café, restaurant, shop or attraction people go to — exactly as written or spoken. Never a street (Jl./Jalan …), mall, building, ruko block or area: those go in area. Empty string if the venue is never named." },
-    area: { type: "string", description: "Where the venue is: street, mall or building, and area or city in Indonesia, e.g. \"Jl. Pahlawan Seribu, BSD City\" or \"Gading Serpong, Tangerang\". Empty string if unknown." },
+    area: { type: "string", description: "Where the venue is: street, mall or building, and area or city in Indonesia, e.g. \"Jl. Pahlawan Seribu, BSD City\" or \"Gading Serpong, Tangerang\". Copy street, mall and building names as written in the caption or location tag, comma-separated. Empty string if unknown." },
     nameEvidence: {
       type: "object",
       properties: {

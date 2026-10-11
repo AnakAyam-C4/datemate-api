@@ -24,14 +24,18 @@ import { seededRandom } from "../../utils/random";
 import {
   appears,
   buildTags,
+  chooseName,
   cleanPlaceName,
+  combinedAddress,
   expandAreaAliases,
   inferPriceLevel,
   inferTags,
   isConfirmed,
   isStreetOrArea,
   looksLikeLocation,
+  looksLikeSeriesTitle,
   parseSignals,
+  shortArea,
   swiftCapitalized,
 } from "../2-caption/signals";
 import type { PlaceCategory, PlaceSetting, PlaceVibe } from "../shared/vocabulary";
@@ -132,6 +136,10 @@ struct Case: Decodable {
     let text: String?
     let list: [String]?
     let extraction: GeminiPlaceExtraction?
+    let model: String?
+    let modelAddress: String?
+    let tagAddress: String?
+    let author: String?
 }
 
 extension Port {
@@ -156,6 +164,16 @@ extension Port {
         case "capitalize": return (c.text ?? "").capitalized
         case "location": return looksLikeLocation(c.text ?? "")
         case "streetOrArea": return isStreetOrArea(c.text ?? "")
+        case "series": return looksLikeSeriesTitle(c.text ?? "")
+        case "shortArea": return shortArea(c.text ?? "")
+        case "decide":
+            let s = parseSignals(title: c.title ?? "", caption: c.caption ?? "")
+            return [
+                "name": chooseName(signals: s, tagName: c.title ?? "", caption: c.caption ?? "",
+                                   modelName: c.model ?? "", authorNickname: c.author) as Any? ?? NSNull(),
+                "address": combinedAddress(signals: s, modelAddress: c.modelAddress ?? "",
+                                           caption: c.caption ?? "", tagAddress: c.tagAddress ?? ""),
+            ] as [String: Any]
         default: return NSNull()
         }
     }
@@ -189,7 +207,8 @@ const compileHarness = (): string => {
 type Case =
   | { kind: "signals"; title: string; caption: string }
   | { kind: "tags"; extraction: Extraction }
-  | { kind: "infer" | "price" | "clean" | "alias" | "capitalize" | "location" | "streetOrArea"; text: string }
+  | { kind: "infer" | "price" | "clean" | "alias" | "capitalize" | "location" | "streetOrArea" | "series" | "shortArea"; text: string }
+  | { kind: "decide"; title: string; caption: string; model: string; modelAddress: string; tagAddress: string; author: string | null }
   | { kind: "confirm"; title: string; list: string[] }
   | { kind: "appears"; title: string; text: string };
 
@@ -284,6 +303,28 @@ const APPEAR_TEXTS = [
   "#masenmatcha",
 ];
 
+/** Captions with a venue name and a street or area, no 📍 (made-up names). */
+const DECIDE_CAPTIONS = [
+  "Kedai Sore enak bgt di Jl. Pahlawan Seribu, Serpong! #kedaisore #bsd",
+  "nemu Kedai Sore di jln pahlawan seribu bsd 😭",
+  "part 3 dari 100 kopi viral #fyp",
+  "enak bgt 😭 #fyp",
+  "Kopi Pagi\n📍 Ruko Golden 8, Gading Serpong, Tangerang\n100 makanan layak viral gading serpong |",
+];
+const DECIDE_TAGS = ["", "Kopi Pagi", "Grand Junction", "Gading Serpong", "KEDAI SORE"];
+const DECIDE_MODEL_NAMES = ["", "Kedai Sore", "Kopi Pagi", "100 Kopi Viral", "Grand Junction", "Kezia Eats", "Kopi Senja eps 2", "7 Bakmi"];
+const DECIDE_ADDRESSES: ReadonlyArray<readonly [string, string]> = [
+  ["", ""],
+  ["Jl. Pahlawan Seribu, BSD City", ""],
+  ["Jl. Pahlawan Seribu, Serpong, Tangerang Selatan", "Jl. Boulevard Raya No. 1, Pakulonan Barat, Kec. Kelapa Dua, Kabupaten Tangerang, Banten 15810"],
+  ["Grand Junction, Gading Serpong", "Jl. Kemang Raya No. 5, Kemang, Jakarta Selatan 12730"],
+];
+const SHORT_AREAS = [
+  "", "Kemang", "Ruko Maggiore, Gading Serpong, Tangerang", "Jl. Kemang Raya No. 5", "No. 8, Kec. Kelapa Dua, 15810",
+  "Kota Tua, Jakarta", "Kelapa Gading, DKI Jakarta 14240", "Jln Melati, RT 02/RW 03, Desa Suka, Jawa Barat",
+  " , ,", "123456, Senayan", "Pantai Indah Kapuk 2, Jakarta Utara, Indonesia",
+];
+
 const SPECIALTIES = ["", "  Sunset View ", "fyp", "ab", "abc", "cafe", "🍵🍵🍵", "café", "café", "シシシ", "Japanese", "fypシ", "street food", "áb"];
 
 const buildCorpus = (): Case[] => {
@@ -359,6 +400,19 @@ const buildCorpus = (): Case[] => {
     for (const text of APPEAR_TEXTS) cases.push({ kind: "appears", title, text });
   }
 
+  // Caption name vs Gemini's name vs the location tag; street + area addresses.
+  for (const caption of [...NAME_CAPTIONS, ...DECIDE_CAPTIONS]) {
+    for (const title of DECIDE_TAGS) {
+      for (const model of DECIDE_MODEL_NAMES) {
+        for (const [modelAddress, tagAddress] of DECIDE_ADDRESSES) {
+          cases.push({ kind: "decide", title, caption, model, modelAddress, tagAddress, author: model === "Kezia Eats" ? "kezia eats" : null });
+        }
+      }
+    }
+  }
+  for (const text of [...DECIDE_MODEL_NAMES, ...PLACE_OR_LOCATION]) cases.push({ kind: "series", text });
+  for (const text of [...SHORT_AREAS, ...DECIDE_ADDRESSES.flat()]) cases.push({ kind: "shortArea", text });
+
   return cases;
 };
 
@@ -375,6 +429,15 @@ const runTypeScript = (c: Case): unknown => {
     case "capitalize": return swiftCapitalized(c.text);
     case "location": return looksLikeLocation(c.text);
     case "streetOrArea": return isStreetOrArea(c.text);
+    case "series": return looksLikeSeriesTitle(c.text);
+    case "shortArea": return shortArea(c.text);
+    case "decide": {
+      const s = parseSignals(c.title, c.caption);
+      return {
+        name: chooseName(s, c.title, c.caption, c.model, c.author),
+        address: combinedAddress(s, c.modelAddress, c.caption, c.tagAddress),
+      };
+    }
   }
 };
 

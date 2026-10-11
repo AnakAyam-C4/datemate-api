@@ -241,14 +241,16 @@ export const parseSignals = (title: string, caption: string): CaptionSignals => 
     if (pinIsLocation && nameNearPin !== null) {
       signals.nameCandidate = nameNearPin;
       signals.addressCandidate = locationLine;
-    } else if (poiName !== null && !poiIsLocation) {
-      signals.nameCandidate = poiName;
-    } else if (pinIsLocation) {
-      // The pin (and any tag) only say WHERE it is — leave the name to Gemini.
-      signals.addressCandidate = locationLine;
-    } else if (parts[0] !== undefined) {
+    } else if (!pinIsLocation && parts[0] !== undefined) {
+      // The 📍 line names the venue itself. What the creator wrote beats
+      // TikTok's location tag, which is often the mall or a spot nearby.
       signals.nameCandidate = parts[0];
       if (parts.length > 1) signals.addressCandidate = parts.slice(1).join(", ");
+    } else if (pinIsLocation) {
+      // The pin only says WHERE it is. A tag that names a venue stays the
+      // name; otherwise Gemini reads the whole caption for it.
+      signals.addressCandidate = locationLine;
+      if (poiName !== null && !looksLikeLocation(poiName)) signals.nameCandidate = poiName;
     }
   } else if (poiName !== null && looksLikeLocation(poiName)) {
     // The tag is a street, mall or area — keep it as the location only.
@@ -448,6 +450,119 @@ export const appears = (name: string, text: string): boolean => {
   let hits = 0;
   for (const word of nameWords) if (textWords.has(word)) hits += 1;
   return hits / nameWords.size >= 0.6;
+};
+
+// --- Choosing the name and address ---------------------------------------------
+
+/** Foundation `caseInsensitiveCompare(_:) == .orderedSame`. */
+const sameIgnoringCase = (a: string, b: string) => canonical(a.toLowerCase()) === canonical(b.toLowerCase());
+
+/**
+ * The video's series or list title, not a venue: a count up front ("100
+ * makanan layak viral") or a part / episode number ("part 3", "eps. 12").
+ * One-digit counts pass — venues do start with those.
+ */
+export const looksLikeSeriesTitle = (text: string): boolean => {
+  const lower = text.toLowerCase();
+  return /^[0-9]{2,} /u.test(lower) || /(?:^|[^\p{L}])(?:part|eps?|episode) ?\.? ?[0-9]/u.test(lower);
+};
+
+/**
+ * Port of `AISummaryService.chooseName`. The place's name, best source first —
+ * null when nothing names it:
+ *  1. the caption's own name: the 📍 line or the name next to it;
+ *  2. Gemini's name, when it's really in the caption — the model can drift onto
+ *     a series title or a list hashtag, the 📍 line can't;
+ *  3. TikTok's location tag — often the mall or street the venue is in, or a
+ *     spot nearby, so a name the caption gives beats it.
+ * Never a street or bare area, the location itself, or the creator's own name.
+ */
+export const chooseName = (
+  signals: CaptionSignals,
+  tagName: string,
+  caption: string,
+  modelName: string,
+  authorNickname: string | null,
+): string | null => {
+  const candidate = signals.nameCandidate !== null && !isStreetOrArea(signals.nameCandidate) ? signals.nameCandidate : null;
+  // parseSignals falls back to the tag when the caption names nothing.
+  const candidateIsTag =
+    tagName.length > 0 && candidate !== null && sameIgnoringCase(candidate, tagName) && !appears(tagName, caption);
+
+  const locations = [signals.addressCandidate, looksLikeLocation(tagName) ? tagName : null].filter(
+    (location): location is string => location !== null,
+  );
+  const model = trimWhitespacesAndNewlines(modelName);
+  const modelIsUsable =
+    model.length > 0 &&
+    !isStreetOrArea(model) &&
+    !looksLikeSeriesTitle(model) &&
+    appears(model, caption) &&
+    !locations.some((location) => squashed(location).startsWith(squashed(model)));
+
+  const isCreator = (name: string) =>
+    authorNickname !== null && authorNickname.length > 0 && sameIgnoringCase(name, authorNickname);
+  return (
+    [candidateIsTag ? null : candidate, modelIsUsable ? model : null, candidateIsTag ? candidate : null].find(
+      (name): name is string => name !== null && !isCreator(name),
+    ) ?? null
+  );
+};
+
+/**
+ * Port of `AISummaryService.combinedAddress`. Where the place is, from what the
+ * post itself says, most specific first:
+ *  1. the creator's 📍 line (or a location tag that is a mall or area);
+ *  2. the street / building Gemini found, joined with the known area so the
+ *     map search has both. Parts Gemini wrote that aren't in the caption or tag
+ *     are dropped;
+ *  3. TikTok's tag address.
+ */
+export const combinedAddress = (
+  signals: CaptionSignals,
+  modelAddress: string,
+  caption: string,
+  tagAddress: string,
+): string => {
+  // A canonical known area came from the area scan, not from the creator.
+  const written = signals.addressCandidate;
+  const knownArea = written !== null && KNOWN_AREAS.some((entry) => entry.canonical === written) ? written : null;
+  if (written !== null && knownArea === null) return written;
+
+  const source = `${caption} ${tagAddress}`;
+  let parts = modelAddress
+    .split(",")
+    .map(trimWhitespacesAndNewlines)
+    .filter((part) => appears(part, source));
+  if (knownArea !== null) {
+    const area = squashed(knownArea);
+    parts = parts.filter((part) => !swiftContains(area, squashed(part)));
+    parts.push(knownArea);
+  }
+  return parts.length === 0 ? tagAddress : parts.join(", ");
+};
+
+const ADMIN_PREFIX = new RegExp(String.raw`^(?:jl|jln|jalan|no|kec|kel|kab|kabupaten|kecamatan|kelurahan|desa|rt|rw)(?:\.|${S}|$)`, "u");
+const PROVINCES: ReadonlySet<string> = new Set([
+  "indonesia", "banten", "dki jakarta", "jawa barat", "jawa tengah",
+  "jawa timur", "di yogyakarta", "daerah istimewa yogyakarta",
+]);
+
+/**
+ * Port of `AISummaryService.shortArea`. A short, readable area for the
+ * description — "Ruko Maggiore, Gading Serpong", not a full TikTok address
+ * with street number, district, regency, province and postcode.
+ */
+export const shortArea = (address: string): string => {
+  const parts = address
+    .split(",")
+    .map((part) => trimWhitespacesAndNewlines(part.replace(/(?<![0-9])[0-9]{5}(?![0-9])/gu, "")))
+    .filter((part) => {
+      const lower = part.toLowerCase();
+      return graphemes(part).some(isLetterGrapheme) && !ADMIN_PREFIX.test(lower) && !PROVINCES.has(canonical(lower));
+    });
+  const short = parts.slice(0, 2).join(", ");
+  return short.length === 0 ? trimWhitespacesAndNewlines(address) : short;
 };
 
 // --- Tags --------------------------------------------------------------------
