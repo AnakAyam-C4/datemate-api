@@ -16,7 +16,7 @@
 import { readFile, stat } from "node:fs/promises";
 import type { GoogleGenAI, Part } from "@google/genai" with { "resolution-mode": "import" };
 import { z } from "zod";
-import { looksLikeLocation } from "../2-caption/signals";
+import { isStreetOrArea } from "../2-caption/signals";
 import { importsConfig } from "../shared/config";
 import { PLACE_CATEGORIES, PLACE_SETTINGS, PLACE_VIBES } from "../shared/vocabulary";
 
@@ -141,8 +141,10 @@ export const verifyEvidence = (facts: GeminiFacts, context: EvidenceContext): Ev
 
   if (!name || source === "none") return { accepted: false, reason: "no_name" };
   if (GENERIC_NAMES.has(squash(name))) return { accepted: false, reason: "generic_name" };
-  // A street, mall or area is where the place is, not what it's called.
-  if (looksLikeLocation(name)) return { accepted: false, reason: "location_not_name" };
+  // A street or a bare area is where the place is, not what it's called. Only
+  // these are rejected: a venue named after its area or mall ("Mie Gacoan
+  // Bintaro", "Starbucks Plaza Senayan") is still a venue.
+  if (isStreetOrArea(name)) return { accepted: false, reason: "location_not_name" };
   if (context.creatorNames.some((creator) => creator && squash(creator) === squash(name))) {
     return { accepted: false, reason: "creator_name" };
   }

@@ -376,17 +376,47 @@ const looksLikeName = (line: string): boolean => {
   return !NAME_FILLER.some((filler) => swiftContains(padded, filler));
 };
 
+/**
+ * Ambiguous words (park, street, avenue, city, market…) are left out on
+ * purpose: "Kopi Park" and "Street Food Corner" are venues.
+ */
 const LOCATION_MARKERS = [
-  " mall", " junction", " plaza", " square", " tower", " ruko ", " jl ", " jl.", " jalan ",
-  " lt ", " lt.", " lantai ", " blok ", " boulevard", " market", " park ", " city ",
-  " residence", " walk ", " avenue", " street",
+  " mall", " plaza", " junction", " tower", " ruko ", " blok ", " lt ", " lt.", " lantai ",
+  " boulevard", " residence", " gedung ", " apartemen",
 ];
 
-/** A mall, a junction, a ruko, a street, a known area — somewhere a place is, rather than the place itself. */
+/** Swift `components(separatedBy: CharacterSet.alphanumerics.inverted)`, without the empty pieces. */
+const alphanumericWords = (text: string) => text.split(/[^\p{L}\p{M}\p{N}]+/u).filter((word) => word.length > 0);
+
+/** Every word of every known area, plus generic geography words. */
+const AREA_WORDS: ReadonlySet<string> = new Set([
+  "city", "kota", "kab", "kabupaten", "kecamatan", "kec", "selatan", "utara",
+  "barat", "timur", "pusat", "tengah", "raya", "indonesia", "banten", "jawa", "dki",
+  ...KNOWN_AREAS.flatMap((entry) => [...entry.keys, entry.canonical].flatMap((phrase) => alphanumericWords(phrase.toLowerCase()))),
+]);
+
+/**
+ * Certainly not a venue: a street ("Jl. Kemang Raya", "Jalan …") or nothing but
+ * area names ("BSD City", "Gading Serpong, Tangerang"). The only check allowed
+ * to reject a name — a venue named after its area ("Mie Gacoan Bintaro") has
+ * other words in it, so it passes.
+ */
+export const isStreetOrArea = (text: string): boolean => {
+  const lower = trimWhitespacesAndNewlines(text.toLowerCase());
+  if (/^(?:jl|jln|jalan)(?:\.|\s|$)/u.test(lower)) return true;
+  const words = alphanumericWords(lower);
+  return words.length > 0 && words.every((word) => AREA_WORDS.has(word));
+};
+
+/**
+ * Probably WHERE a place is — a mall, plaza, junction, ruko, tower, or a street
+ * or area — so the venue's name should be looked for elsewhere. Only steers
+ * where to look; it never rejects a name on its own, because venues often carry
+ * their mall in the name ("Starbucks Plaza Senayan").
+ */
 export const looksLikeLocation = (text: string): boolean => {
   const lower = ` ${text.toLowerCase()} `;
-  if (LOCATION_MARKERS.some((marker) => swiftContains(lower, marker))) return true;
-  return KNOWN_AREAS.some((entry) => entry.keys.some((key) => swiftContains(lower, ` ${key} `)));
+  return LOCATION_MARKERS.some((marker) => swiftContains(lower, marker)) || isStreetOrArea(text);
 };
 
 /** Letters and digits only, lower-cased, accents folded: "Masen Matcha", "#masenmatcha" → "masenmatcha". */
